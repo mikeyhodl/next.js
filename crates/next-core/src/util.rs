@@ -8,12 +8,12 @@ use swc_core::{
 };
 use turbo_rcstr::RcStr;
 use turbo_tasks::{
-    trace::TraceRawVcs, util::WrapFuture, FxIndexMap, FxIndexSet, ResolvedVc, TaskInput,
-    ValueDefault, ValueToString, Vc,
+    trace::TraceRawVcs, util::WrapFuture, FxIndexMap, FxIndexSet, NonLocalValue, ResolvedVc,
+    TaskInput, ValueDefault, ValueToString, Vc,
 };
 use turbo_tasks_fs::{
     self, json::parse_json_rope_with_source_context, rope::Rope, util::join_path, File,
-    FileContent, FileSystemPath,
+    FileContent, FileSystem, FileSystemPath,
 };
 use turbopack_core::{
     asset::AssetContent,
@@ -32,6 +32,7 @@ use turbopack_ecmascript::{
 };
 
 use crate::{
+    embed_js::next_js_fs,
     next_config::{NextConfig, RouteHas},
     next_import_map::get_next_package,
     next_manifests::MiddlewareMatcher,
@@ -121,7 +122,10 @@ pub async fn foreign_code_context_condition(
     // of the `node_modules` specific resolve options (the template files are
     // technically node module files).
     let not_next_template_dir = ContextCondition::not(ContextCondition::InPath(
-        get_next_package(*project_path).join(NEXT_TEMPLATE_PATH.into()),
+        get_next_package(*project_path)
+            .join(NEXT_TEMPLATE_PATH.into())
+            .to_resolved()
+            .await?,
     ));
 
     let result = ContextCondition::all(vec![
@@ -135,6 +139,31 @@ pub async fn foreign_code_context_condition(
         )),
     ]);
     Ok(result)
+}
+
+/// Determines if the module is an internal asset (i.e overlay, fallback) coming
+/// from the embedded FS, don't apply user defined transforms.
+///
+/// [TODO] turbopack specific embed fs should be handled by internals of
+/// turbopack itself and user config should not try to leak this. However,
+/// currently we apply few transform options subject to next.js's configuration
+/// even if it's embedded assets.
+pub async fn internal_assets_conditions() -> Result<ContextCondition> {
+    Ok(ContextCondition::any(vec![
+        ContextCondition::InPath(next_js_fs().root().to_resolved().await?),
+        ContextCondition::InPath(
+            turbopack_ecmascript_runtime::embed_fs()
+                .root()
+                .to_resolved()
+                .await?,
+        ),
+        ContextCondition::InPath(
+            turbopack_node::embed_js::embed_fs()
+                .root()
+                .to_resolved()
+                .await?,
+        ),
+    ]))
 }
 
 #[derive(
@@ -151,6 +180,7 @@ pub async fn foreign_code_context_condition(
     PartialOrd,
     Ord,
     TaskInput,
+    NonLocalValue,
 )]
 #[serde(rename_all = "lowercase")]
 pub enum NextRuntime {
@@ -642,7 +672,7 @@ pub async fn load_next_js_template(
     let path = virtual_next_js_template_path(project_path, path.to_string());
 
     let content = &*file_content_rope(path.read()).await?;
-    let content = content.to_str()?.to_string();
+    let content = content.to_str()?.into_owned();
 
     let parent_path = path.parent();
     let parent_path_value = &*parent_path.await?;
@@ -915,7 +945,7 @@ pub async fn load_next_js_templateon<T: DeserializeOwned>(
     let content = &*file_path.read().await?;
 
     let FileContent::Content(file) = content else {
-        bail!("Expected file content at {}", path);
+        bail!("Expected file content at {}", file_path.to_string().await?);
     };
 
     let result: T = parse_json_rope_with_source_context(file.content())?;

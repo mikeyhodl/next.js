@@ -17,6 +17,7 @@ default = []
 verify_serialization = []
 trace_aggregation_update = []
 trace_find_and_schedule = []
+trace_task_dirty = []
 lmdb = ["dep:lmdb-rkv"]
 
 [dependencies]
@@ -55,9 +56,7 @@ turbo-tasks-testing = { workspace = true }
 criterion = { workspace = true, features = ["async_tokio"] }
 
 [build-dependencies]
-anyhow = { workspace = true }
 turbo-tasks-build = { workspace = true }
-vergen-gitcl = { version = "1.0.1" }
 
 [[bench]]
 name = "mod"

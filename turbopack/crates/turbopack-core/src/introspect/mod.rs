@@ -6,7 +6,7 @@ pub mod utils;
 use turbo_rcstr::RcStr;
 use turbo_tasks::{FxIndexSet, ResolvedVc, Vc};
 
-type VcDynIntrospectable = Vc<Box<dyn Introspectable>>;
+type VcDynIntrospectable = ResolvedVc<Box<dyn Introspectable>>;
 
 #[turbo_tasks::value(transparent)]
 pub struct IntrospectableChildren(FxIndexSet<(ResolvedVc<RcStr>, VcDynIntrospectable)>);

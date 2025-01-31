@@ -140,6 +140,13 @@ declare module 'react-server-dom-webpack/server.edge' {
       temporaryReferences?: TemporaryReferenceSet
     }
   ): Promise<T>
+  export function decodeReplyFromAsyncIterable<T>(
+    iterable: AsyncIterable<[string, string | File]>,
+    webpackMap: ServerManifest,
+    options?: {
+      temporaryReferences?: TemporaryReferenceSet
+    }
+  ): Promise<T>
   export function decodeAction<T>(
     body: FormData,
     serverManifest: ServerManifest
@@ -210,7 +217,7 @@ declare module 'react-server-dom-webpack/server.node' {
   ): Promise<ReactFormState | null>
 }
 declare module 'react-server-dom-webpack/static.edge' {
-  export function prerender(
+  export function unstable_prerender(
     children: any,
     webpackMap: {
       readonly [id: string]: {

@@ -2,10 +2,12 @@ use std::io::Write;
 
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
-use turbo_tasks::{trace::TraceRawVcs, ResolvedVc, Upcast, ValueToString, Vc};
+use turbo_tasks::{
+    trace::TraceRawVcs, NonLocalValue, ResolvedVc, TaskInput, Upcast, ValueToString, Vc,
+};
 use turbo_tasks_fs::{rope::Rope, FileSystemPath};
 use turbopack_core::{
-    chunk::{AsyncModuleInfo, ChunkItem, ChunkItemExt, ChunkingContext},
+    chunk::{AsyncModuleInfo, ChunkItem, ChunkItemExt, ChunkItemTy, ChunkingContext},
     code_builder::{fileify_source_map, Code, CodeBuilder},
     error::PrettyPrintError,
     issue::{code_gen::CodeGenerationIssue, IssueExt, IssueSeverity, StyledString},
@@ -48,7 +50,7 @@ impl EcmascriptChunkItemContent {
 
         Ok(EcmascriptChunkItemContent {
             rewrite_source_path: if *chunking_context.should_use_file_source_map_uris().await? {
-                Some(chunking_context.context_path().to_resolved().await?)
+                Some(chunking_context.root_path().to_resolved().await?)
             } else {
                 None
             },
@@ -155,12 +157,11 @@ impl EcmascriptChunkItemContent {
             match source_map {
                 Some(map) => fileify_source_map(map, *rewrite_source_path)
                     .await?
-                    .map(|v| *v)
-                    .map(Vc::upcast),
+                    .map(ResolvedVc::upcast),
                 None => None,
             }
         } else {
-            self.source_map.map(|v| *v)
+            self.source_map
         };
 
         code.push_source(&self.inner_code, source_map);
@@ -181,7 +182,9 @@ impl EcmascriptChunkItemContent {
     }
 }
 
-#[derive(PartialEq, Eq, Default, Debug, Clone, Serialize, Deserialize, TraceRawVcs)]
+#[derive(
+    PartialEq, Eq, Default, Debug, Clone, Serialize, Deserialize, TraceRawVcs, NonLocalValue,
+)]
 pub struct EcmascriptChunkItemOptions {
     /// Whether this chunk item should be in "use strict" mode.
     pub strict: bool,
@@ -208,6 +211,15 @@ pub struct EcmascriptChunkItemOptions {
     /// `__turbopack_wasm__` to load WebAssembly.
     pub wasm: bool,
     pub placeholder_for_future_extensions: (),
+}
+
+#[derive(
+    Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash, TraceRawVcs, TaskInput, NonLocalValue,
+)]
+pub struct EcmascriptChunkItemWithAsyncInfo {
+    pub ty: ChunkItemTy,
+    pub chunk_item: ResolvedVc<Box<dyn EcmascriptChunkItem>>,
+    pub async_info: Option<ResolvedVc<AsyncModuleInfo>>,
 }
 
 #[turbo_tasks::value_trait]

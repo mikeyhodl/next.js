@@ -18,12 +18,12 @@ use turbo_tasks::{
     apply_effects, ReadConsistency, ReadRef, ResolvedVc, TryJoinIterExt, TurboTasks, Value,
     ValueToString, Vc,
 };
+use turbo_tasks_backend::{noop_backing_storage, BackendOptions, TurboTasksBackend};
 use turbo_tasks_env::DotenvProcessEnv;
 use turbo_tasks_fs::{
     json::parse_json_with_source_context, util::sys_to_unix, DiskFileSystem, FileSystem,
     FileSystemPath,
 };
-use turbo_tasks_memory::MemoryBackend;
 use turbopack::{
     ecmascript::{EcmascriptInputTransform, TreeShakingMode},
     module_options::{
@@ -48,6 +48,7 @@ use turbopack_core::{
     free_var_references,
     issue::{Issue, IssueDescriptionExt},
     module::Module,
+    module_graph::ModuleGraph,
     output::{OutputAsset, OutputAssets},
     reference_type::{EntryReferenceSubType, ReferenceType},
     source::Source,
@@ -155,11 +156,17 @@ fn test(resource: PathBuf) {
 async fn run(resource: PathBuf) -> Result<()> {
     register();
 
-    let tt = TurboTasks::new(MemoryBackend::default());
+    let tt = TurboTasks::new(TurboTasksBackend::new(
+        BackendOptions {
+            storage_mode: None,
+            ..Default::default()
+        },
+        noop_backing_storage(),
+    ));
     let task = tt.spawn_once_task(async move {
-        let emit = run_inner(resource.to_str().unwrap().into());
-        emit.strongly_consistent().await?;
-        apply_effects(emit).await?;
+        let emit_op = run_inner_operation(resource.to_str().unwrap().into());
+        emit_op.read_strongly_consistent().await?;
+        apply_effects(emit_op).await?;
 
         Ok(Vc::<()>::default())
     });
@@ -169,11 +176,11 @@ async fn run(resource: PathBuf) -> Result<()> {
     Ok(())
 }
 
-#[turbo_tasks::function]
-async fn run_inner(resource: RcStr) -> Result<()> {
-    let out = run_test(resource);
-    let _ = out.resolve_strongly_consistent().await?;
-    let captured_issues = out.peek_issues_with_path().await?;
+#[turbo_tasks::function(operation)]
+async fn run_inner_operation(resource: RcStr) -> Result<()> {
+    let out_op = run_test_operation(resource);
+    let out_vc = out_op.resolve_strongly_consistent().await?;
+    let captured_issues = out_op.peek_issues_with_path().await?;
 
     let plain_issues = captured_issues
         .iter_with_shortest_path()
@@ -181,15 +188,15 @@ async fn run_inner(resource: RcStr) -> Result<()> {
         .try_join()
         .await?;
 
-    snapshot_issues(plain_issues, out.join("issues".into()), &REPO_ROOT)
+    snapshot_issues(plain_issues, out_vc.join("issues".into()), &REPO_ROOT)
         .await
         .context("Unable to handle issues")?;
 
     Ok(())
 }
 
-#[turbo_tasks::function]
-async fn run_test(resource: RcStr) -> Result<Vc<FileSystemPath>> {
+#[turbo_tasks::function(operation)]
+async fn run_test_operation(resource: RcStr) -> Result<Vc<FileSystemPath>> {
     let test_path = canonicalize(&resource)?;
     assert!(test_path.exists(), "{} does not exist", resource);
     assert!(
@@ -203,21 +210,20 @@ async fn run_test(resource: RcStr) -> Result<Vc<FileSystemPath>> {
         Err(_) => SnapshotOptions::default(),
         Ok(options_str) => parse_json_with_source_context(&options_str).unwrap(),
     };
-    let root_fs = DiskFileSystem::new("workspace".into(), REPO_ROOT.clone(), vec![]);
     let project_fs = DiskFileSystem::new("project".into(), REPO_ROOT.clone(), vec![]);
     let project_root = project_fs.root().to_resolved().await?;
 
     let relative_path = test_path.strip_prefix(&*REPO_ROOT)?;
     let relative_path: RcStr = sys_to_unix(relative_path.to_str().unwrap()).into();
-    let path = root_fs
-        .root()
-        .join(relative_path.clone())
-        .to_resolved()
-        .await?;
     let project_path = project_root
         .join(relative_path.clone())
         .to_resolved()
         .await?;
+
+    let project_path_to_project_root = project_path
+        .await?
+        .get_relative_path_to(&*project_root.await?)
+        .context("Project path is in root path")?;
 
     let entry_asset = project_path.join(options.entry.into());
 
@@ -336,15 +342,16 @@ async fn run_test(resource: RcStr) -> Result<Vc<FileSystemPath>> {
         .await?
         .map(|asset| EvaluatableAssets::one(asset.to_evaluatable(asset_context)));
 
-    let chunk_root_path = path.join("output".into()).to_resolved().await?;
-    let static_root_path = path.join("static".into()).to_resolved().await?;
+    let chunk_root_path = project_path.join("output".into()).to_resolved().await?;
+    let static_root_path = project_path.join("static".into()).to_resolved().await?;
 
     let chunking_context: Vc<Box<dyn ChunkingContext>> = match options.runtime {
         Runtime::Browser => Vc::upcast(
             BrowserChunkingContext::builder(
                 project_root,
-                path,
-                path,
+                project_path,
+                ResolvedVc::cell(project_path_to_project_root),
+                project_path,
                 chunk_root_path,
                 static_root_path,
                 env,
@@ -355,8 +362,9 @@ async fn run_test(resource: RcStr) -> Result<Vc<FileSystemPath>> {
         Runtime::NodeJs => Vc::upcast(
             NodeJsChunkingContext::builder(
                 project_root,
-                path,
-                path,
+                project_path,
+                ResolvedVc::cell(project_path_to_project_root),
+                project_path,
                 chunk_root_path,
                 static_root_path,
                 env,
@@ -383,13 +391,24 @@ async fn run_test(resource: RcStr) -> Result<Vc<FileSystemPath>> {
     let chunks = if let Some(ecmascript) =
         Vc::try_resolve_sidecast::<Box<dyn EvaluatableAsset>>(entry_module).await?
     {
+        let evaluatable_assets = runtime_entries
+            .unwrap_or_else(EvaluatableAssets::empty)
+            .with_entry(Vc::upcast(ecmascript));
+        let all_modules = Vc::cell(
+            evaluatable_assets
+                .await?
+                .iter()
+                .copied()
+                .map(ResolvedVc::upcast)
+                .collect(),
+        );
+        let module_graph = ModuleGraph::from_modules(all_modules);
         // TODO: Load runtime entries from snapshots
         match options.runtime {
             Runtime::Browser => chunking_context.evaluated_chunk_group_assets(
                 entry_module.ident(),
-                runtime_entries
-                    .unwrap_or_else(EvaluatableAssets::empty)
-                    .with_entry(Vc::upcast(ecmascript)),
+                evaluatable_assets,
+                module_graph,
                 Value::new(AvailabilityInfo::Root),
             ),
             Runtime::NodeJs => {
@@ -412,9 +431,8 @@ async fn run_test(resource: RcStr) -> Result<Vc<FileSystemPath>> {
                                 )
                                 .with_extension("entry.js".into()),
                             entry_module,
-                            runtime_entries
-                                .unwrap_or_else(EvaluatableAssets::empty)
-                                .with_entry(Vc::upcast(ecmascript)),
+                            evaluatable_assets,
+                            module_graph,
                             OutputAssets::empty(),
                             Value::new(AvailabilityInfo::Root),
                         )
@@ -426,7 +444,8 @@ async fn run_test(resource: RcStr) -> Result<Vc<FileSystemPath>> {
     } else if let Some(chunkable) =
         Vc::try_resolve_downcast::<Box<dyn ChunkableModule>>(entry_module).await?
     {
-        chunking_context.root_chunk_group_assets(chunkable)
+        let module_graph = ModuleGraph::from_module(Vc::upcast(chunkable));
+        chunking_context.root_chunk_group_assets(chunkable, module_graph)
     } else {
         // TODO convert into a serve-able asset
         bail!("Entry module is not chunkable, so it can't be used to bootstrap the application")
@@ -435,7 +454,7 @@ async fn run_test(resource: RcStr) -> Result<Vc<FileSystemPath>> {
     let mut seen = HashSet::new();
     let mut queue: VecDeque<_> = chunks.await?.iter().copied().collect();
 
-    let output_path = path.await?;
+    let output_path = project_path.await?;
     while let Some(asset) = queue.pop_front() {
         walk_asset(asset, &output_path, &mut seen, &mut queue)
             .await
@@ -453,7 +472,7 @@ async fn run_test(resource: RcStr) -> Result<Vc<FileSystemPath>> {
         .await
         .context("Actual assets doesn't match with expected assets")?;
 
-    Ok(*path)
+    Ok(*project_path)
 }
 
 async fn walk_asset(

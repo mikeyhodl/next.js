@@ -273,7 +273,12 @@ impl TurboPersistence {
                             // ignore blobs, they are read when needed
                         }
                         _ => {
-                            bail!("Unexpected file in persistence directory: {:?}", path);
+                            if !path
+                                .file_name()
+                                .is_some_and(|s| s.as_encoded_bytes().starts_with(b"."))
+                            {
+                                bail!("Unexpected file in persistence directory: {:?}", path);
+                            }
                         }
                     }
                 }
@@ -283,7 +288,12 @@ impl TurboPersistence {
                         // Already read
                     }
                     _ => {
-                        bail!("Unexpected file in persistence directory: {:?}", path);
+                        if !path
+                            .file_name()
+                            .is_some_and(|s| s.as_encoded_bytes().starts_with(b"."))
+                        {
+                            bail!("Unexpected file in persistence directory: {:?}", path);
+                        }
                     }
                 }
             }
@@ -295,7 +305,7 @@ impl TurboPersistence {
             .into_iter()
             .map(|seq| self.open_sst(seq))
             .collect::<Result<Vec<StaticSortedFile>>>()?;
-        #[cfg(feature = "stats")]
+        #[cfg(feature = "print_stats")]
         {
             for sst in sst_files.iter() {
                 let crate::static_sorted_file::StaticSortedFileRange {

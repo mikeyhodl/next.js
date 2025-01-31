@@ -297,7 +297,9 @@ function isDynamicCodeEvaluationAllowed(
 
   const name = fileName.replace(rootDir ?? '', '')
 
-  return picomatch(middlewareConfig?.unstable_allowDynamic ?? [])(name)
+  return picomatch(middlewareConfig?.unstable_allowDynamic ?? [], {
+    dot: true,
+  })(name)
 }
 
 function buildUnsupportedApiError({
@@ -509,7 +511,11 @@ function getCodeAnalyzer(params: {
           sourceContent: source.toString(),
         })
 
-        if (!dev && isNodeJsModule(importedModule)) {
+        if (
+          !dev &&
+          isNodeJsModule(importedModule) &&
+          !SUPPORTED_NATIVE_MODULES.includes(importedModule)
+        ) {
           compilation.warnings.push(
             buildWebpackError({
               message: `A Node.js module is loaded ('${importedModule}' at line ${node.loc.start.line}) which is not supported in the Edge Runtime.

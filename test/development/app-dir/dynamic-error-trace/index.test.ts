@@ -2,8 +2,6 @@ import { nextTestSetup } from 'e2e-utils'
 import { assertHasRedbox, getRedboxSource } from 'next-test-utils'
 import { outdent } from 'outdent'
 
-const isReactExperimental = process.env.__NEXT_EXPERIMENTAL_PPR === 'true'
-
 function normalizeStackTrace(trace) {
   return trace.replace(/ \(.*\)/g, '')
 }
@@ -37,32 +35,15 @@ describe('app dir - dynamic error trace', () => {
 
     // TODO: Show useful stack
     const normalizedStack = normalizeStackTrace(stackFramesContent)
-    if (isReactExperimental) {
-      expect(normalizedStack).toMatchInlineSnapshot(`
-        "Array.map
-        <anonymous>"
-      `)
-    } else {
-      expect(normalizedStack).toMatchInlineSnapshot(`""`)
-    }
+    expect(normalizedStack).toMatchInlineSnapshot(`
+     "Foo
+     app/lib.js"
+    `)
 
     const codeframe = await getRedboxSource(browser)
     expect(codeframe).toEqual(
-      process.env.TURBOPACK
-        ? outdent`
+      outdent`
             app/lib.js (4:13) @ Foo
-            
-              2 |
-              3 | export function Foo() {
-            > 4 |   useHeaders()
-                |             ^
-              5 |   return 'foo'
-              6 | }
-              7 |
-          `
-        : // TODO: should be "@ Foo" since that's where we put the codeframe and print the source location
-          outdent`
-            app/lib.js (4:13) @ useHeaders
 
               2 |
               3 | export function Foo() {

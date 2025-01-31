@@ -3,7 +3,7 @@ use indoc::formatdoc;
 use serde::{Deserialize, Serialize};
 use turbo_rcstr::RcStr;
 use turbo_tasks::{
-    fxindexmap, trace::TraceRawVcs, Completion, Completions, ResolvedVc, TaskInput,
+    fxindexmap, trace::TraceRawVcs, Completion, Completions, NonLocalValue, ResolvedVc, TaskInput,
     TryFlatJoinIterExt, Value, Vc,
 };
 use turbo_tasks_bytes::stream::SingleValue;
@@ -47,7 +47,18 @@ struct PostCssProcessingResult {
 }
 
 #[derive(
-    Default, Copy, Clone, PartialEq, Eq, Hash, Debug, TraceRawVcs, Serialize, Deserialize, TaskInput,
+    Default,
+    Copy,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    Debug,
+    TraceRawVcs,
+    Serialize,
+    Deserialize,
+    TaskInput,
+    NonLocalValue,
 )]
 pub enum PostCssConfigLocation {
     #[default]
@@ -97,6 +108,7 @@ pub struct PostCssTransform {
     evaluate_context: ResolvedVc<Box<dyn AssetContext>>,
     execution_context: ResolvedVc<ExecutionContext>,
     config_location: PostCssConfigLocation,
+    source_maps: bool,
 }
 
 #[turbo_tasks::value_impl]
@@ -106,11 +118,13 @@ impl PostCssTransform {
         evaluate_context: ResolvedVc<Box<dyn AssetContext>>,
         execution_context: ResolvedVc<ExecutionContext>,
         config_location: PostCssConfigLocation,
+        source_maps: bool,
     ) -> Vc<Self> {
         PostCssTransform {
             evaluate_context,
             execution_context,
             config_location,
+            source_maps,
         }
         .cell()
     }
@@ -126,6 +140,7 @@ impl SourceTransform for PostCssTransform {
                 execution_context: self.execution_context,
                 config_location: self.config_location,
                 source,
+                source_map: self.source_maps,
             }
             .cell(),
         )
@@ -138,6 +153,7 @@ struct PostCssTransformedAsset {
     execution_context: ResolvedVc<ExecutionContext>,
     config_location: PostCssConfigLocation,
     source: ResolvedVc<Box<dyn Source>>,
+    source_map: bool,
 }
 
 #[turbo_tasks::value_impl]
@@ -151,15 +167,22 @@ impl Source for PostCssTransformedAsset {
 #[turbo_tasks::value_impl]
 impl Asset for PostCssTransformedAsset {
     #[turbo_tasks::function]
-    async fn content(self: Vc<Self>) -> Result<Vc<AssetContent>> {
+    async fn content(self: ResolvedVc<Self>) -> Result<Vc<AssetContent>> {
         let this = self.await?;
-        Ok(*self
-            .process()
+        Ok(*transform_process_operation(self)
             .issue_file_path(this.source.ident().path(), "PostCSS processing")
             .await?
+            .connect()
             .await?
             .content)
     }
+}
+
+#[turbo_tasks::function(operation)]
+fn transform_process_operation(
+    asset: ResolvedVc<PostCssTransformedAsset>,
+) -> Vc<ProcessPostCssResult> {
+    asset.process()
 }
 
 #[turbo_tasks::value]
@@ -488,6 +511,7 @@ impl PostCssTransformedAsset {
         };
         let content = content.content().to_str()?;
         let evaluate_context = self.evaluate_context;
+        let source_map = self.source_map;
 
         // This invalidates the transform when the config changes.
         let config_changed = config_changed(*evaluate_context, config_path)
@@ -523,6 +547,7 @@ impl PostCssTransformedAsset {
             args: vec![
                 ResolvedVc::cell(content.into()),
                 ResolvedVc::cell(css_path.into()),
+                ResolvedVc::cell(source_map.into()),
             ],
             additional_invalidation: config_changed,
         })

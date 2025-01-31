@@ -6,13 +6,14 @@ pub use once_cell::sync::{Lazy, OnceCell};
 pub use serde;
 pub use tracing;
 
-pub use super::{
-    magic_any::MagicAny,
-    manager::{find_cell_by_type, notify_scheduled_tasks, spawn_detached_for_testing},
-};
 use crate::{
     debug::ValueDebugFormatString, shrink_to_fit::ShrinkToFit, task::TaskOutput, NonLocalValue,
     RawVc, TaskInput, TaskPersistence, Vc,
+};
+pub use crate::{
+    magic_any::MagicAny,
+    manager::{find_cell_by_type, notify_scheduled_tasks, spawn_detached_for_testing},
+    native_function::{downcast_args_owned, downcast_args_ref, FunctionMeta, NativeFunction},
 };
 
 #[inline(never)]
@@ -52,6 +53,8 @@ where
 {
 }
 
+pub fn assert_argument_is_non_local_value<Argument: NonLocalValue>() {}
+
 #[macro_export]
 macro_rules! stringify_path {
     ($path:path) => {
@@ -66,7 +69,7 @@ macro_rules! stringify_path {
 /// implement [`ShrinkToFit`].
 ///
 /// This is used by the derive macro for [`ShrinkToFit`], which is called by the
-/// [turbo_tasks::value][crate::value] macro.
+/// [turbo_tasks::value][macro@crate::value] macro.
 ///
 /// [autoderef]: http://lukaskalbertodt.github.io/2019/12/05/generalized-autoref-based-specialization.html
 pub struct ShrinkToFitDerefSpecialization<'a, T> {

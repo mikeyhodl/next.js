@@ -17,15 +17,15 @@ pub mod output_asset;
 
 use anyhow::Result;
 use turbo_rcstr::RcStr;
-use turbo_tasks::{ResolvedVc, ValueToString, Vc};
+use turbo_tasks::{ResolvedVc, Vc};
 use turbopack_core::{
     asset::{Asset, AssetContent},
     chunk::{ChunkItem, ChunkType, ChunkableModule, ChunkingContext},
     context::AssetContext,
     ident::AssetIdent,
     module::Module,
-    output::OutputAsset,
-    reference::{ModuleReferences, SingleOutputAssetReference},
+    module_graph::ModuleGraph,
+    output::{OutputAsset, OutputAssets},
     source::Source,
 };
 use turbopack_css::embed::CssEmbed;
@@ -97,6 +97,7 @@ impl ChunkableModule for StaticModuleAsset {
     #[turbo_tasks::function]
     async fn as_chunk_item(
         self: ResolvedVc<Self>,
+        _module_graph: Vc<ModuleGraph>,
         chunking_context: ResolvedVc<Box<dyn ChunkingContext>>,
     ) -> Result<Vc<Box<dyn turbopack_core::chunk::ChunkItem>>> {
         Ok(Vc::upcast(ModuleChunkItem::cell(ModuleChunkItem {
@@ -133,21 +134,8 @@ impl ChunkItem for ModuleChunkItem {
     }
 
     #[turbo_tasks::function]
-    async fn references(&self) -> Result<Vc<ModuleReferences>> {
-        Ok(Vc::cell(vec![ResolvedVc::upcast(
-            SingleOutputAssetReference::new(
-                *ResolvedVc::upcast(self.static_asset),
-                Vc::cell(
-                    format!(
-                        "static(url) {}",
-                        self.static_asset.ident().to_string().await?
-                    )
-                    .into(),
-                ),
-            )
-            .to_resolved()
-            .await?,
-        )]))
+    fn references(&self) -> Vc<OutputAssets> {
+        Vc::cell(vec![ResolvedVc::upcast(self.static_asset)])
     }
 
     #[turbo_tasks::function]

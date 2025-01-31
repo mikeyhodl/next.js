@@ -16,7 +16,8 @@ use swc_core::{
 };
 use turbo_rcstr::RcStr;
 use turbo_tasks::{
-    trace::TraceRawVcs, FxIndexMap, ResolvedVc, TryFlatJoinIterExt, ValueToString, Vc,
+    trace::TraceRawVcs, FxIndexMap, NonLocalValue, ResolvedVc, TryFlatJoinIterExt, ValueToString,
+    Vc,
 };
 use turbo_tasks_fs::glob::Glob;
 use turbopack_core::{
@@ -24,6 +25,7 @@ use turbopack_core::{
     ident::AssetIdent,
     issue::{analyze::AnalyzeIssue, IssueExt, IssueSeverity, StyledString},
     module::Module,
+    module_graph::ModuleGraph,
     reference::ModuleReference,
 };
 
@@ -34,7 +36,7 @@ use crate::{
     magic_identifier,
 };
 
-#[derive(Clone, Hash, Debug, PartialEq, Eq, Serialize, Deserialize, TraceRawVcs)]
+#[derive(Clone, Hash, Debug, PartialEq, Eq, Serialize, Deserialize, TraceRawVcs, NonLocalValue)]
 pub enum EsmExport {
     /// A local binding that is exported (export { a } or export const a = 1)
     ///
@@ -43,9 +45,9 @@ pub enum EsmExport {
     /// An imported binding that is exported (export { a as b } from "...")
     ///
     /// The last bool is true if the binding is a mutable binding
-    ImportedBinding(Vc<Box<dyn ModuleReference>>, RcStr, bool),
+    ImportedBinding(ResolvedVc<Box<dyn ModuleReference>>, RcStr, bool),
     /// An imported namespace that is exported (export * from "...")
-    ImportedNamespace(Vc<Box<dyn ModuleReference>>),
+    ImportedNamespace(ResolvedVc<Box<dyn ModuleReference>>),
     /// An error occurred while resolving the export
     Error,
 }
@@ -55,6 +57,10 @@ pub async fn is_export_missing(
     module: ResolvedVc<Box<dyn EcmascriptChunkPlaceable>>,
     export_name: RcStr,
 ) -> Result<Vc<bool>> {
+    if export_name == "__turbopack_module_id__" {
+        return Ok(Vc::cell(false));
+    }
+
     let exports = module.get_exports().await?;
     let exports = match &*exports {
         EcmascriptExports::None => return Ok(Vc::cell(true)),
@@ -107,7 +113,7 @@ pub async fn all_known_export_names(
     Ok(Vc::cell(export_names.esm_exports.keys().cloned().collect()))
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TraceRawVcs)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TraceRawVcs, NonLocalValue)]
 pub enum FoundExportType {
     Found,
     Dynamic,
@@ -429,11 +435,10 @@ pub struct EsmExports {
     pub star_exports: Vec<ResolvedVc<Box<dyn ModuleReference>>>,
 }
 
-/// The expanded version of [EsmExports], the `exports` field here includes all
-/// exports that could be expanded from `star_exports`.
+/// The expanded version of [`EsmExports`], the `exports` field here includes all exports that could
+/// be expanded from `star_exports`.
 ///
-/// `star_exports` that could not be (fully) expanded end up in
-/// `dynamic_exports`.
+/// [`EsmExports::star_exports`] that could not be (fully) expanded end up in `dynamic_exports`.
 #[turbo_tasks::value(shared)]
 #[derive(Hash, Debug)]
 pub struct ExpandedExports {
@@ -464,7 +469,11 @@ impl EsmExports {
                 if !exports.contains_key(export) {
                     exports.insert(
                         export.clone(),
-                        EsmExport::ImportedBinding(Vc::upcast(*esm_ref), export.clone(), false),
+                        EsmExport::ImportedBinding(
+                            ResolvedVc::upcast(esm_ref),
+                            export.clone(),
+                            false,
+                        ),
                     );
                 }
             }
@@ -487,7 +496,8 @@ impl CodeGenerateable for EsmExports {
     #[turbo_tasks::function]
     async fn code_generation(
         self: Vc<Self>,
-        _context: Vc<Box<dyn ChunkingContext>>,
+        _module_graph: Vc<ModuleGraph>,
+        _chunking_context: Vc<Box<dyn ChunkingContext>>,
     ) -> Result<Vc<CodeGeneration>> {
         let expanded = self.expand_exports().await?;
 

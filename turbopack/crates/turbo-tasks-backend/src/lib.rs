@@ -1,10 +1,12 @@
 #![feature(anonymous_lifetime_in_impl_trait)]
 #![feature(associated_type_defaults)]
 #![feature(iter_collect_into)]
+#![feature(box_patterns)]
 
 mod backend;
 mod backing_storage;
 mod data;
+mod data_storage;
 mod database;
 mod kv_backing_storage;
 mod utils;
@@ -23,20 +25,24 @@ use crate::database::{
 
 #[cfg(feature = "lmdb")]
 pub type LmdbBackingStorage = KeyValueDatabaseBackingStorage<
-    ReadTransactionCache<
-        StartupCacheLayer<FreshDbOptimization<crate::database::lmdb::LmbdKeyValueDatabase>>,
+    database::read_transaction_cache::ReadTransactionCache<
+        database::startup_cache::StartupCacheLayer<
+            database::fresh_db_optimization::FreshDbOptimization<
+                crate::database::lmdb::LmbdKeyValueDatabase,
+            >,
+        >,
     >,
 >;
 
 #[cfg(feature = "lmdb")]
-pub fn lmdb_backing_storage(path: &Path) -> Result<LmdbBackingStorage> {
+pub fn lmdb_backing_storage(path: &Path, version_info: &str) -> Result<LmdbBackingStorage> {
     use crate::database::{
         fresh_db_optimization::{is_fresh, FreshDbOptimization},
         read_transaction_cache::ReadTransactionCache,
         startup_cache::StartupCacheLayer,
     };
 
-    let path = handle_db_versioning(path)?;
+    let path = handle_db_versioning(path, version_info)?;
     let fresh_db = is_fresh(&path);
     let database = crate::database::lmdb::LmbdKeyValueDatabase::new(&path)?;
     let database = FreshDbOptimization::new(database, fresh_db);
@@ -47,8 +53,8 @@ pub fn lmdb_backing_storage(path: &Path) -> Result<LmdbBackingStorage> {
 
 pub type TurboBackingStorage = KeyValueDatabaseBackingStorage<TurboKeyValueDatabase>;
 
-pub fn turbo_backing_storage(path: &Path) -> Result<TurboBackingStorage> {
-    let path = handle_db_versioning(path)?;
+pub fn turbo_backing_storage(path: &Path, version_info: &str) -> Result<TurboBackingStorage> {
+    let path = handle_db_versioning(path, version_info)?;
     let database = TurboKeyValueDatabase::new(path)?;
     Ok(KeyValueDatabaseBackingStorage::new(database))
 }
@@ -63,14 +69,14 @@ pub fn noop_backing_storage() -> NoopBackingStorage {
 pub type DefaultBackingStorage = LmdbBackingStorage;
 
 #[cfg(feature = "lmdb")]
-pub fn default_backing_storage(path: &Path) -> Result<DefaultBackingStorage> {
-    lmdb_backing_storage(path)
+pub fn default_backing_storage(path: &Path, version_info: &str) -> Result<DefaultBackingStorage> {
+    lmdb_backing_storage(path, version_info)
 }
 
 #[cfg(not(feature = "lmdb"))]
 pub type DefaultBackingStorage = TurboBackingStorage;
 
 #[cfg(not(feature = "lmdb"))]
-pub fn default_backing_storage(path: &Path) -> Result<DefaultBackingStorage> {
-    turbo_backing_storage(path)
+pub fn default_backing_storage(path: &Path, version_info: &str) -> Result<DefaultBackingStorage> {
+    turbo_backing_storage(path, version_info)
 }

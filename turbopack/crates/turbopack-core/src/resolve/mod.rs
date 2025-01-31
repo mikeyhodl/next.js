@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use tracing::{Instrument, Level};
 use turbo_rcstr::RcStr;
 use turbo_tasks::{
-    fxindexmap, trace::TraceRawVcs, FxIndexMap, FxIndexSet, ResolvedVc, TaskInput, TryJoinIterExt,
-    Value, ValueToString, Vc,
+    fxindexmap, trace::TraceRawVcs, FxIndexMap, FxIndexSet, NonLocalValue, OptionVcExt, ResolvedVc,
+    TaskInput, TryJoinIterExt, Value, ValueToString, Vc,
 };
 use turbo_tasks_fs::{
     util::normalize_request, FileSystemEntryType, FileSystemPath, RealPathResult,
@@ -76,7 +76,7 @@ pub enum ModuleResolveResultItem {
         traced: Option<ResolvedVc<ModuleResolveResult>>,
     },
     /// A module could not be created (according to the rules, e.g. no module type as assigned)
-    Unknown(Vc<Box<dyn Source>>),
+    Unknown(ResolvedVc<Box<dyn Source>>),
     Ignore,
     Error(ResolvedVc<RcStr>),
     Empty,
@@ -88,7 +88,7 @@ impl ModuleResolveResultItem {
         Ok(match *self {
             ModuleResolveResultItem::Module(module) => Some(module),
             ModuleResolveResultItem::Unknown(source) => {
-                emit_unknown_module_type_error(source).await?;
+                emit_unknown_module_type_error(*source).await?;
                 None
             }
             ModuleResolveResultItem::Error(_err) => {
@@ -386,7 +386,17 @@ impl Display for ExternalTraced {
 }
 
 #[derive(
-    Copy, Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize, TraceRawVcs, TaskInput,
+    Copy,
+    Clone,
+    Debug,
+    Eq,
+    PartialEq,
+    Hash,
+    Serialize,
+    Deserialize,
+    TraceRawVcs,
+    TaskInput,
+    NonLocalValue,
 )]
 pub enum ExternalType {
     Url,
@@ -415,7 +425,7 @@ pub enum ResolveResultItem {
         traced: ExternalTraced,
     },
     Ignore,
-    Error(Vc<RcStr>),
+    Error(ResolvedVc<RcStr>),
     Empty,
     Custom(u8),
 }
@@ -711,9 +721,7 @@ impl ResolveResult {
                                 }
                                 ResolveResultItem::Ignore => ModuleResolveResultItem::Ignore,
                                 ResolveResultItem::Empty => ModuleResolveResultItem::Empty,
-                                ResolveResultItem::Error(e) => {
-                                    ModuleResolveResultItem::Error(e.to_resolved().await?)
-                                }
+                                ResolveResultItem::Error(e) => ModuleResolveResultItem::Error(e),
                                 ResolveResultItem::Custom(u8) => {
                                     ModuleResolveResultItem::Custom(u8)
                                 }
@@ -1059,11 +1067,18 @@ async fn type_exists(
     refs: &mut Vec<ResolvedVc<Box<dyn Source>>>,
 ) -> Result<Option<ResolvedVc<FileSystemPath>>> {
     let result = fs_path.resolve().await?.realpath_with_links().await?;
-    for path in result.symlinks.iter() {
-        refs.push(ResolvedVc::upcast(
-            FileSource::new(**path).to_resolved().await?,
-        ));
-    }
+    refs.extend(
+        result
+            .symlinks
+            .iter()
+            .map(|path| async move {
+                Ok(ResolvedVc::upcast(
+                    FileSource::new(**path).to_resolved().await?,
+                ))
+            })
+            .try_join()
+            .await?,
+    );
     let path = result.path;
     Ok(if *path.get_type().await? == ty {
         Some(path)
@@ -1077,11 +1092,18 @@ async fn any_exists(
     refs: &mut Vec<ResolvedVc<Box<dyn Source>>>,
 ) -> Result<Option<(FileSystemEntryType, Vc<FileSystemPath>)>> {
     let result = fs_path.resolve().await?.realpath_with_links().await?;
-    for path in result.symlinks.iter() {
-        refs.push(ResolvedVc::upcast(
-            FileSource::new(**path).to_resolved().await?,
-        ));
-    }
+    refs.extend(
+        result
+            .symlinks
+            .iter()
+            .map(|path| async move {
+                Ok(ResolvedVc::upcast(
+                    FileSource::new(**path).to_resolved().await?,
+                ))
+            })
+            .try_join()
+            .await?,
+    );
     let path = result.path;
     let ty = *path.get_type().await?;
     Ok(
@@ -1269,7 +1291,7 @@ pub async fn find_context_file_or_package_key(
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TraceRawVcs, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TraceRawVcs, Debug, NonLocalValue)]
 enum FindPackageItem {
     PackageDirectory(ResolvedVc<FileSystemPath>),
     PackageFile(ResolvedVc<FileSystemPath>),
@@ -1394,7 +1416,10 @@ pub async fn resolve_raw(
     path: Vc<Pattern>,
     force_in_lookup_dir: bool,
 ) -> Result<Vc<ResolveResult>> {
-    async fn to_result(request: &str, path: Vc<FileSystemPath>) -> Result<Vc<ResolveResult>> {
+    async fn to_result(
+        request: &str,
+        path: ResolvedVc<FileSystemPath>,
+    ) -> Result<Vc<ResolveResult>> {
         let RealPathResult { path, symlinks } = &*path.realpath_with_links().await?;
         Ok(ResolveResult::source_with_affecting_sources(
             RequestKey::new(request.into()),
@@ -1514,7 +1539,7 @@ pub async fn url_resolve(
     origin: Vc<Box<dyn ResolveOrigin>>,
     request: Vc<Request>,
     reference_type: Value<ReferenceType>,
-    issue_source: Option<ResolvedVc<IssueSource>>,
+    issue_source: Option<Vc<IssueSource>>,
     is_optional: bool,
 ) -> Result<Vc<ModuleResolveResult>> {
     let resolve_options = origin.resolve_options(reference_type.clone());
@@ -1558,6 +1583,7 @@ pub async fn url_resolve(
     .await
 }
 
+#[tracing::instrument(level = "trace", skip_all)]
 async fn handle_before_resolve_plugins(
     lookup_path: Vc<FileSystemPath>,
     reference_type: Value<ReferenceType>,
@@ -1566,7 +1592,7 @@ async fn handle_before_resolve_plugins(
 ) -> Result<Option<Vc<ResolveResult>>> {
     for plugin in &options.await?.before_resolve_plugins {
         let condition = plugin.before_resolve_condition().resolve().await?;
-        if !condition.await?.matches(request).await? {
+        if !*condition.matches(request).await? {
             continue;
         }
 
@@ -1580,6 +1606,7 @@ async fn handle_before_resolve_plugins(
     Ok(None)
 }
 
+#[tracing::instrument(level = "trace", skip_all)]
 async fn handle_after_resolve_plugins(
     lookup_path: Vc<FileSystemPath>,
     reference_type: Value<ReferenceType>,
@@ -1747,7 +1774,7 @@ async fn resolve_internal_inline(
                             results.push(
                                 resolved(
                                     RequestKey::new(matched_pattern.clone()),
-                                    *path,
+                                    **path,
                                     lookup_path,
                                     request,
                                     options_value,
@@ -1760,7 +1787,7 @@ async fn resolve_internal_inline(
                         }
                         PatternMatch::Directory(matched_pattern, path) => {
                             results.push(
-                                resolve_into_folder(*path, options)
+                                resolve_into_folder(**path, options)
                                     .with_request(matched_pattern.clone()),
                             );
                         }
@@ -2162,7 +2189,7 @@ async fn resolve_relative_request(
                             results.push(
                                 resolved(
                                     RequestKey::new(matched_pattern.into()),
-                                    *path,
+                                    **path,
                                     lookup_path,
                                     request,
                                     options_value,
@@ -2179,7 +2206,7 @@ async fn resolve_relative_request(
                         results.push(
                             resolved(
                                 RequestKey::new(matched_pattern.into()),
-                                *path,
+                                **path,
                                 lookup_path,
                                 request,
                                 options_value,
@@ -2202,7 +2229,7 @@ async fn resolve_relative_request(
                     results.push(
                         resolved(
                             RequestKey::new(matched_pattern.into()),
-                            *path,
+                            **path,
                             lookup_path,
                             request,
                             options_value,
@@ -2220,7 +2247,7 @@ async fn resolve_relative_request(
                 results.push(
                     resolved(
                         RequestKey::new(matched_pattern.clone()),
-                        *path,
+                        **path,
                         lookup_path,
                         request,
                         options_value,
@@ -2236,7 +2263,8 @@ async fn resolve_relative_request(
     // Directory matches must be resolved AFTER file matches
     for m in matches.iter() {
         if let PatternMatch::Directory(matched_pattern, path) = m {
-            results.push(resolve_into_folder(*path, options).with_request(matched_pattern.clone()));
+            results
+                .push(resolve_into_folder(**path, options).with_request(matched_pattern.clone()));
         }
     }
 
@@ -2253,6 +2281,7 @@ async fn apply_in_package(
     fragment: Vc<RcStr>,
 ) -> Result<Option<Vc<ResolveResult>>> {
     // Check alias field for module aliases first
+    // ast-grep-ignore: to-resolved-in-loop
     for in_package in options_value.in_package.iter() {
         // resolve_module_request is called when importing a node
         // module, not a PackageInternal one, so the imports field
@@ -2875,7 +2904,7 @@ pub async fn handle_resolve_error(
     request: Vc<Request>,
     resolve_options: Vc<ResolveOptions>,
     is_optional: bool,
-    source: Option<ResolvedVc<IssueSource>>,
+    source: Option<Vc<IssueSource>>,
 ) -> Result<Vc<ModuleResolveResult>> {
     async fn is_unresolvable(result: Vc<ModuleResolveResult>) -> Result<bool> {
         Ok(*result.resolve().await?.is_unresolvable().await?)
@@ -2919,7 +2948,7 @@ pub async fn handle_resolve_source_error(
     request: Vc<Request>,
     resolve_options: Vc<ResolveOptions>,
     is_optional: bool,
-    source: Option<ResolvedVc<IssueSource>>,
+    source: Option<Vc<IssueSource>>,
 ) -> Result<Vc<ResolveResult>> {
     async fn is_unresolvable(result: Vc<ResolveResult>) -> Result<bool> {
         Ok(*result.resolve().await?.is_unresolvable().await?)
@@ -2963,7 +2992,7 @@ async fn emit_resolve_error_issue(
     request: Vc<Request>,
     resolve_options: Vc<ResolveOptions>,
     err: anyhow::Error,
-    source: Option<ResolvedVc<IssueSource>>,
+    source: Option<Vc<IssueSource>>,
 ) -> Result<()> {
     let severity = if is_optional || resolve_options.await?.loose_errors {
         IssueSeverity::Warning.resolved_cell()
@@ -2977,7 +3006,7 @@ async fn emit_resolve_error_issue(
         request: request.to_resolved().await?,
         resolve_options: resolve_options.to_resolved().await?,
         error_message: Some(format!("{}", PrettyPrintError(&err))),
-        source,
+        source: source.to_resolved().await?,
     }
     .resolved_cell()
     .emit();
@@ -2990,7 +3019,7 @@ async fn emit_unresolvable_issue(
     reference_type: Value<ReferenceType>,
     request: Vc<Request>,
     resolve_options: Vc<ResolveOptions>,
-    source: Option<ResolvedVc<IssueSource>>,
+    source: Option<Vc<IssueSource>>,
 ) -> Result<()> {
     let severity = if is_optional || resolve_options.await?.loose_errors {
         IssueSeverity::Warning.resolved_cell()
@@ -3004,7 +3033,7 @@ async fn emit_unresolvable_issue(
         request: request.to_resolved().await?,
         resolve_options: resolve_options.to_resolved().await?,
         error_message: None,
-        source,
+        source: source.to_resolved().await?,
     }
     .resolved_cell()
     .emit();

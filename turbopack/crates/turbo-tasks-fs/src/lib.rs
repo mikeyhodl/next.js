@@ -60,7 +60,7 @@ use tracing::Instrument;
 use turbo_rcstr::RcStr;
 use turbo_tasks::{
     debug::ValueDebugFormat, effect, mark_session_dependent, mark_stateful, trace::TraceRawVcs,
-    Completion, Invalidator, ReadRef, ResolvedVc, ValueToString, Vc,
+    Completion, Invalidator, NonLocalValue, ReadRef, ResolvedVc, ValueToString, Vc,
 };
 use turbo_tasks_hash::{
     hash_xxh3_hash128, hash_xxh3_hash64, DeterministicHash, DeterministicHasher,
@@ -181,14 +181,14 @@ pub trait FileSystem: ValueToString {
     }
     fn read(self: Vc<Self>, fs_path: Vc<FileSystemPath>) -> Vc<FileContent>;
     fn read_link(self: Vc<Self>, fs_path: Vc<FileSystemPath>) -> Vc<LinkContent>;
-    fn read_dir(self: Vc<Self>, fs_path: Vc<FileSystemPath>) -> Vc<DirectoryContent>;
+    fn raw_read_dir(self: Vc<Self>, fs_path: Vc<FileSystemPath>) -> Vc<RawDirectoryContent>;
     fn track(self: Vc<Self>, fs_path: Vc<FileSystemPath>) -> Vc<Completion>;
     fn write(self: Vc<Self>, fs_path: Vc<FileSystemPath>, content: Vc<FileContent>) -> Vc<()>;
     fn write_link(self: Vc<Self>, fs_path: Vc<FileSystemPath>, target: Vc<LinkContent>) -> Vc<()>;
     fn metadata(self: Vc<Self>, fs_path: Vc<FileSystemPath>) -> Vc<FileMeta>;
 }
 
-#[derive(Serialize, Deserialize, TraceRawVcs, ValueDebugFormat)]
+#[derive(Serialize, Deserialize, TraceRawVcs, ValueDebugFormat, NonLocalValue)]
 struct DiskFileSystemInner {
     pub name: RcStr,
     pub root: RcStr,
@@ -456,68 +456,6 @@ impl DiskFileSystem {
 
         Ok(Self::cell(instance))
     }
-
-    #[turbo_tasks::function(fs)]
-    async fn read_dir_internal(
-        &self,
-        fs_path: Vc<FileSystemPath>,
-    ) -> Result<Vc<InternalDirectoryContent>> {
-        mark_session_dependent();
-        let full_path = self.to_sys_path(fs_path).await?;
-        self.inner.register_dir_invalidator(&full_path)?;
-
-        // we use the sync std function here as it's a lot faster (600%) in
-        // node-file-trace
-        let read_dir = match retry_blocking(&full_path, |path| {
-            let _span =
-                tracing::info_span!("read directory", path = display(path.display())).entered();
-            std::fs::read_dir(path)
-        })
-        .await
-        {
-            Ok(dir) => dir,
-            Err(e)
-                if e.kind() == ErrorKind::NotFound
-                    || e.kind() == ErrorKind::NotADirectory
-                    || e.kind() == ErrorKind::InvalidFilename =>
-            {
-                return Ok(InternalDirectoryContent::not_found());
-            }
-            Err(e) => {
-                bail!(anyhow!(e).context(format!("reading dir {}", full_path.display())))
-            }
-        };
-
-        let entries = read_dir
-            .filter_map(|r| {
-                let e = match r {
-                    Ok(e) => e,
-                    Err(err) => return Some(Err(err.into())),
-                };
-
-                let path = e.path();
-
-                // we filter out any non unicode names and paths without the same root here
-                let file_name: RcStr = path.file_name()?.to_str()?.into();
-                let path_to_root = sys_to_unix(path.strip_prefix(&self.inner.root).ok()?.to_str()?);
-
-                let path = path_to_root.into();
-
-                let entry = match e.file_type() {
-                    Ok(t) if t.is_file() => InternalDirectoryEntry::File(path),
-                    Ok(t) if t.is_dir() => InternalDirectoryEntry::Directory(path),
-                    Ok(t) if t.is_symlink() => InternalDirectoryEntry::Symlink(path),
-                    Ok(_) => InternalDirectoryEntry::Other(path),
-                    Err(err) => return Some(Err(err.into())),
-                };
-
-                Some(anyhow::Ok((file_name, entry)))
-            })
-            .collect::<Result<_>>()
-            .with_context(|| format!("reading directory item in {}", full_path.display()))?;
-
-        Ok(InternalDirectoryContent::new(entries))
-    }
 }
 
 impl Debug for DiskFileSystem {
@@ -553,36 +491,58 @@ impl FileSystem for DiskFileSystem {
         Ok(content.cell())
     }
 
-    #[turbo_tasks::function]
-    async fn read_dir(self: Vc<Self>, fs_path: Vc<FileSystemPath>) -> Result<Vc<DirectoryContent>> {
-        match &*self.read_dir_internal(fs_path).await? {
-            InternalDirectoryContent::NotFound => Ok(DirectoryContent::not_found()),
-            InternalDirectoryContent::Entries(entries) => {
-                let fs = *fs_path.await?.fs;
-                let normalize =
-                    |path: &RcStr| FileSystemPath::new_normalized(fs, path.clone()).to_resolved();
-                let mut normalized_entries = AutoMap::new();
-                for (name, entry) in entries {
-                    let entry = match entry {
-                        InternalDirectoryEntry::File(path) => {
-                            DirectoryEntry::File(normalize(path).await?)
-                        }
-                        InternalDirectoryEntry::Directory(path) => {
-                            DirectoryEntry::Directory(normalize(path).await?)
-                        }
-                        InternalDirectoryEntry::Symlink(path) => {
-                            DirectoryEntry::Symlink(normalize(path).await?)
-                        }
-                        InternalDirectoryEntry::Other(path) => {
-                            DirectoryEntry::Other(normalize(path).await?)
-                        }
-                        InternalDirectoryEntry::Error => DirectoryEntry::Error,
-                    };
-                    normalized_entries.insert(name.clone(), entry);
-                }
-                Ok(DirectoryContent::new(normalized_entries))
+    #[turbo_tasks::function(fs)]
+    async fn raw_read_dir(&self, fs_path: Vc<FileSystemPath>) -> Result<Vc<RawDirectoryContent>> {
+        mark_session_dependent();
+        let full_path = self.to_sys_path(fs_path).await?;
+        self.inner.register_dir_invalidator(&full_path)?;
+
+        // we use the sync std function here as it's a lot faster (600%) in
+        // node-file-trace
+        let read_dir = match retry_blocking(&full_path, |path| {
+            let _span =
+                tracing::info_span!("read directory", path = display(path.display())).entered();
+            std::fs::read_dir(path)
+        })
+        .await
+        {
+            Ok(dir) => dir,
+            Err(e)
+                if e.kind() == ErrorKind::NotFound
+                    || e.kind() == ErrorKind::NotADirectory
+                    || e.kind() == ErrorKind::InvalidFilename =>
+            {
+                return Ok(RawDirectoryContent::not_found());
             }
-        }
+            Err(e) => {
+                bail!(anyhow!(e).context(format!("reading dir {}", full_path.display())))
+            }
+        };
+
+        let entries = read_dir
+            .filter_map(|r| {
+                let e = match r {
+                    Ok(e) => e,
+                    Err(err) => return Some(Err(err.into())),
+                };
+
+                // we filter out any non unicode names
+                let file_name = e.file_name().to_str()?.into();
+
+                let entry = match e.file_type() {
+                    Ok(t) if t.is_file() => RawDirectoryEntry::File,
+                    Ok(t) if t.is_dir() => RawDirectoryEntry::Directory,
+                    Ok(t) if t.is_symlink() => RawDirectoryEntry::Symlink,
+                    Ok(_) => RawDirectoryEntry::Other,
+                    Err(err) => return Some(Err(err.into())),
+                };
+
+                Some(anyhow::Ok((file_name, entry)))
+            })
+            .collect::<Result<_>>()
+            .with_context(|| format!("reading directory item in {}", full_path.display()))?;
+
+        Ok(RawDirectoryContent::new(entries))
     }
 
     #[turbo_tasks::function(fs)]
@@ -944,6 +904,38 @@ impl ValueToString for DiskFileSystem {
     }
 }
 
+pub fn get_relative_path_to(path: &str, other_path: &str) -> String {
+    fn split(s: &str) -> impl Iterator<Item = &str> {
+        let empty = s.is_empty();
+        let mut iterator = s.split('/');
+        if empty {
+            iterator.next();
+        }
+        iterator
+    }
+
+    let mut self_segments = split(path).peekable();
+    let mut other_segments = split(other_path).peekable();
+    while self_segments.peek() == other_segments.peek() {
+        self_segments.next();
+        if other_segments.next().is_none() {
+            return ".".to_string();
+        }
+    }
+    let mut result = Vec::new();
+    if self_segments.peek().is_none() {
+        result.push(".");
+    } else {
+        while self_segments.next().is_some() {
+            result.push("..");
+        }
+    }
+    for segment in other_segments {
+        result.push(segment);
+    }
+    result.join("/")
+}
+
 #[turbo_tasks::value]
 #[derive(Debug, Clone)]
 pub struct FileSystemPath {
@@ -1004,34 +996,8 @@ impl FileSystemPath {
         if self.fs != other.fs {
             return None;
         }
-        fn split(s: &str) -> impl Iterator<Item = &str> {
-            let empty = s.is_empty();
-            let mut iterator = s.split('/');
-            if empty {
-                iterator.next();
-            }
-            iterator
-        }
-        let mut self_segments = split(&self.path).peekable();
-        let mut other_segments = split(&other.path).peekable();
-        while self_segments.peek() == other_segments.peek() {
-            self_segments.next();
-            if other_segments.next().is_none() {
-                return Some(".".into());
-            }
-        }
-        let mut result = Vec::new();
-        if self_segments.peek().is_none() {
-            result.push(".");
-        } else {
-            while self_segments.next().is_some() {
-                result.push("..");
-            }
-        }
-        for segment in other_segments {
-            result.push(segment);
-        }
-        Some(result.join("/").into())
+
+        Some(get_relative_path_to(&self.path, &other.path).into())
     }
 
     /// Returns the final component of the FileSystemPath, or an empty string
@@ -1416,8 +1382,8 @@ impl FileSystemPath {
     ///
     /// DETERMINISM: Result is in random order. Either sort result or do not
     /// depend on the order.
-    pub fn read_dir(self: Vc<Self>) -> Vc<DirectoryContent> {
-        self.fs().read_dir(self)
+    pub fn raw_read_dir(self: Vc<Self>) -> Vc<RawDirectoryContent> {
+        self.fs().raw_read_dir(self)
     }
 
     pub fn track(self: Vc<Self>) -> Vc<Completion> {
@@ -1451,6 +1417,39 @@ impl FileSystemPath {
 
 #[turbo_tasks::value_impl]
 impl FileSystemPath {
+    /// Reads content of a directory.
+    ///
+    /// DETERMINISM: Result is in random order. Either sort result or do not
+    /// depend on the order.
+    #[turbo_tasks::function]
+    pub async fn read_dir(self: Vc<Self>) -> Result<Vc<DirectoryContent>> {
+        match &*self.await?.fs.raw_read_dir(self).await? {
+            RawDirectoryContent::NotFound => Ok(DirectoryContent::not_found()),
+            RawDirectoryContent::Entries(entries) => {
+                let mut normalized_entries = AutoMap::new();
+                for (name, entry) in entries {
+                    let entry = match entry {
+                        RawDirectoryEntry::File => {
+                            DirectoryEntry::File(self.join(name.clone()).to_resolved().await?)
+                        }
+                        RawDirectoryEntry::Directory => {
+                            DirectoryEntry::Directory(self.join(name.clone()).to_resolved().await?)
+                        }
+                        RawDirectoryEntry::Symlink => {
+                            DirectoryEntry::Symlink(self.join(name.clone()).to_resolved().await?)
+                        }
+                        RawDirectoryEntry::Other => {
+                            DirectoryEntry::Other(self.join(name.clone()).to_resolved().await?)
+                        }
+                        RawDirectoryEntry::Error => DirectoryEntry::Error,
+                    };
+                    normalized_entries.insert(name.clone(), entry);
+                }
+                Ok(DirectoryContent::new(normalized_entries))
+            }
+        }
+    }
+
     #[turbo_tasks::function]
     pub async fn parent(self: Vc<Self>) -> Result<Vc<FileSystemPath>> {
         let this = self.await?;
@@ -1480,12 +1479,12 @@ impl FileSystemPath {
             return Ok(FileSystemEntryType::cell(FileSystemEntryType::Directory));
         }
         let parent = self.parent().resolve().await?;
-        let dir_content = parent.read_dir().await?;
+        let dir_content = parent.raw_read_dir().await?;
         match &*dir_content {
-            DirectoryContent::NotFound => {
+            RawDirectoryContent::NotFound => {
                 Ok(FileSystemEntryType::cell(FileSystemEntryType::NotFound))
             }
-            DirectoryContent::Entries(entries) => {
+            RawDirectoryContent::Entries(entries) => {
                 let (_, file_name) = this.split_file_name();
                 if let Some(entry) = entries.get(file_name) {
                     Ok(FileSystemEntryType::cell(entry.into()))
@@ -1702,7 +1701,7 @@ impl FileContent {
 }
 
 bitflags! {
-  #[derive(Default, Serialize, Deserialize, TraceRawVcs)]
+  #[derive(Default, Serialize, Deserialize, TraceRawVcs, NonLocalValue)]
   pub struct LinkType: u8 {
       const DIRECTORY = 0b00000001;
       const ABSOLUTE = 0b00000010;
@@ -2167,16 +2166,18 @@ pub enum FileLinesContent {
     NotFound,
 }
 
-#[derive(Hash, Clone, Debug, PartialEq, Eq, TraceRawVcs, Serialize, Deserialize)]
-pub enum InternalDirectoryEntry {
-    File(RcStr),
-    Directory(RcStr),
-    Symlink(RcStr),
-    Other(RcStr),
+#[derive(Hash, Clone, Debug, PartialEq, Eq, TraceRawVcs, Serialize, Deserialize, NonLocalValue)]
+pub enum RawDirectoryEntry {
+    File,
+    Directory,
+    Symlink,
+    Other,
     Error,
 }
 
-#[derive(Hash, Clone, Copy, Debug, PartialEq, Eq, TraceRawVcs, Serialize, Deserialize)]
+#[derive(
+    Hash, Clone, Copy, Debug, PartialEq, Eq, TraceRawVcs, Serialize, Deserialize, NonLocalValue,
+)]
 pub enum DirectoryEntry {
     File(ResolvedVc<FileSystemPath>),
     Directory(ResolvedVc<FileSystemPath>),
@@ -2243,20 +2244,38 @@ impl From<&DirectoryEntry> for FileSystemEntryType {
     }
 }
 
+impl From<RawDirectoryEntry> for FileSystemEntryType {
+    fn from(entry: RawDirectoryEntry) -> Self {
+        FileSystemEntryType::from(&entry)
+    }
+}
+
+impl From<&RawDirectoryEntry> for FileSystemEntryType {
+    fn from(entry: &RawDirectoryEntry) -> Self {
+        match entry {
+            RawDirectoryEntry::File => FileSystemEntryType::File,
+            RawDirectoryEntry::Directory => FileSystemEntryType::Directory,
+            RawDirectoryEntry::Symlink => FileSystemEntryType::Symlink,
+            RawDirectoryEntry::Other => FileSystemEntryType::Other,
+            RawDirectoryEntry::Error => FileSystemEntryType::Error,
+        }
+    }
+}
+
 #[turbo_tasks::value]
 #[derive(Debug)]
-pub enum InternalDirectoryContent {
-    Entries(Vec<(RcStr, InternalDirectoryEntry)>),
+pub enum RawDirectoryContent {
+    Entries(AutoMap<RcStr, RawDirectoryEntry>),
     NotFound,
 }
 
-impl InternalDirectoryContent {
-    pub fn new(entries: Vec<(RcStr, InternalDirectoryEntry)>) -> Vc<Self> {
-        Self::cell(InternalDirectoryContent::Entries(entries))
+impl RawDirectoryContent {
+    pub fn new(entries: AutoMap<RcStr, RawDirectoryEntry>) -> Vc<Self> {
+        Self::cell(RawDirectoryContent::Entries(entries))
     }
 
     pub fn not_found() -> Vc<Self> {
-        Self::cell(InternalDirectoryContent::NotFound)
+        Self::cell(RawDirectoryContent::NotFound)
     }
 }
 
@@ -2293,8 +2312,8 @@ impl FileSystem for NullFileSystem {
     }
 
     #[turbo_tasks::function]
-    fn read_dir(&self, _fs_path: Vc<FileSystemPath>) -> Vc<DirectoryContent> {
-        DirectoryContent::not_found()
+    fn raw_read_dir(&self, _fs_path: Vc<FileSystemPath>) -> Vc<RawDirectoryContent> {
+        RawDirectoryContent::not_found()
     }
 
     #[turbo_tasks::function]
@@ -2350,6 +2369,22 @@ pub fn register() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_get_relative_path_to() {
+        assert_eq!(get_relative_path_to("a/b/c", "a/b/c").as_str(), ".");
+        assert_eq!(get_relative_path_to("a/c/d", "a/b/c").as_str(), "../../b/c");
+        assert_eq!(get_relative_path_to("", "a/b/c").as_str(), "./a/b/c");
+        assert_eq!(get_relative_path_to("a/b/c", "").as_str(), "../../..");
+        assert_eq!(
+            get_relative_path_to("a/b/c", "c/b/a").as_str(),
+            "../../../c/b/a"
+        );
+        assert_eq!(
+            get_relative_path_to("file:///a/b/c", "file:///c/b/a").as_str(),
+            "../../../c/b/a"
+        );
+    }
 
     #[tokio::test]
     async fn with_extension() {

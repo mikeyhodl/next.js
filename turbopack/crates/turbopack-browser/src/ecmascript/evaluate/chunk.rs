@@ -15,6 +15,7 @@ use turbopack_core::{
     code_builder::{Code, CodeBuilder},
     ident::AssetIdent,
     module::Module,
+    module_graph::ModuleGraph,
     output::{OutputAsset, OutputAssets},
     source_map::{GenerateSourceMap, OptionSourceMap, SourceMapAsset},
 };
@@ -36,6 +37,9 @@ pub(crate) struct EcmascriptDevEvaluateChunk {
     ident: ResolvedVc<AssetIdent>,
     other_chunks: ResolvedVc<OutputAssets>,
     evaluatable_assets: ResolvedVc<EvaluatableAssets>,
+    // TODO(sokra): It's weird to use ModuleGraph here, we should convert evaluatable_assets to a
+    // list of chunk items before passing it to this struct
+    module_graph: ResolvedVc<ModuleGraph>,
 }
 
 #[turbo_tasks::value_impl]
@@ -47,12 +51,14 @@ impl EcmascriptDevEvaluateChunk {
         ident: ResolvedVc<AssetIdent>,
         other_chunks: ResolvedVc<OutputAssets>,
         evaluatable_assets: ResolvedVc<EvaluatableAssets>,
+        module_graph: ResolvedVc<ModuleGraph>,
     ) -> Vc<Self> {
         EcmascriptDevEvaluateChunk {
             chunking_context,
             ident,
             other_chunks,
             evaluatable_assets,
+            module_graph,
         }
         .cell()
     }
@@ -69,6 +75,10 @@ impl EcmascriptDevEvaluateChunk {
         let environment = this.chunking_context.environment();
 
         let output_root = this.chunking_context.output_root().await?;
+        let output_root_to_root_path = this.chunking_context.output_root_to_root_path();
+        let source_maps = this
+            .chunking_context
+            .reference_chunk_source_maps(Vc::upcast(self));
         let chunk_path_vc = self.ident().path();
         let chunk_path = chunk_path_vc.await?;
         let chunk_public_path = if let Some(path) = output_root.get_path_to(&chunk_path) {
@@ -94,6 +104,7 @@ impl EcmascriptDevEvaluateChunk {
             .iter()
             .map({
                 let chunking_context = this.chunking_context;
+                let module_graph = this.module_graph;
                 move |entry| async move {
                     if let Some(placeable) =
                         ResolvedVc::try_sidecast::<Box<dyn EcmascriptChunkPlaceable>>(*entry)
@@ -101,7 +112,7 @@ impl EcmascriptDevEvaluateChunk {
                     {
                         Ok(Some(
                             placeable
-                                .as_chunk_item(Vc::upcast(*chunking_context))
+                                .as_chunk_item(*module_graph, Vc::upcast(*chunking_context))
                                 .id()
                                 .await?,
                         ))
@@ -145,7 +156,8 @@ impl EcmascriptDevEvaluateChunk {
                     environment,
                     chunking_context.chunk_base_path(),
                     Value::new(chunking_context.runtime_type()),
-                    Vc::cell(output_root.to_string().into()),
+                    output_root_to_root_path,
+                    source_maps,
                 );
                 code.push_code(&*runtime_code.await?);
             }
@@ -154,7 +166,8 @@ impl EcmascriptDevEvaluateChunk {
                     environment,
                     chunking_context.chunk_base_path(),
                     Value::new(chunking_context.runtime_type()),
-                    Vc::cell(output_root.to_string().into()),
+                    output_root_to_root_path,
+                    source_maps,
                 );
                 code.push_code(&*runtime_code.await?);
             }
@@ -165,7 +178,7 @@ impl EcmascriptDevEvaluateChunk {
             }
         }
 
-        if code.has_source_map() {
+        if *source_maps.await? && code.has_source_map() {
             let filename = chunk_path.file_name();
             write!(
                 code,
@@ -181,7 +194,7 @@ impl EcmascriptDevEvaluateChunk {
             this.chunking_context.await?.minify_type(),
             MinifyType::Minify
         ) {
-            return Ok(minify(chunk_path_vc, code));
+            return Ok(minify(chunk_path_vc, code, source_maps));
         }
 
         Ok(code)
@@ -218,9 +231,14 @@ impl OutputAsset for EcmascriptDevEvaluateChunk {
                 .await?,
         );
 
-        for chunk in &*self.other_chunks.await? {
-            ident.add_modifier(chunk.ident().to_string().to_resolved().await?);
-        }
+        ident.modifiers.extend(
+            self.other_chunks
+                .await?
+                .iter()
+                .map(|chunk| chunk.ident().to_string().to_resolved())
+                .try_join()
+                .await?,
+        );
 
         let ident = AssetIdent::new(Value::new(ident));
         Ok(AssetIdent::from_path(
