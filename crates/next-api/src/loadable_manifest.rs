@@ -27,7 +27,7 @@ pub async fn create_react_loadable_manifest(
     for (_, (module_id, chunk_output)) in dynamic_import_entries.into_iter() {
         let chunk_output = chunk_output.await?;
 
-        let id = module_id.to_string().await?.clone_value();
+        let id = module_id.to_string().owned().await?;
 
         let client_relative_path_value = client_relative_path.await?;
         let files = chunk_output
@@ -36,7 +36,7 @@ pub async fn create_react_loadable_manifest(
                 let client_relative_path_value = client_relative_path_value.clone();
                 async move {
                     Ok(client_relative_path_value
-                        .get_path_to(&*file.ident().path().await?)
+                        .get_path_to(&*file.path().await?)
                         .map(|path| path.into()))
                 }
             })

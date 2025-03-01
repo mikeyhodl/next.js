@@ -10,10 +10,7 @@ use rustc_hash::FxHashMap;
 use turbo_rcstr::RcStr;
 use turbo_tasks::{debug::ValueDebug, ResolvedVc, Value, ValueToString, Vc};
 use turbopack_core::{
-    chunk::{
-        ChunkableModule, ChunkableModuleReference, ChunkingContext, ChunkingType,
-        ChunkingTypeOption,
-    },
+    chunk::{ChunkableModule, ChunkableModuleReference, ChunkingContext},
     ident::AssetIdent,
     issue::IssueSource,
     module_graph::ModuleGraph,
@@ -36,7 +33,7 @@ pub enum ReferencedAsset {
 pub struct UrlAssetReference {
     pub origin: ResolvedVc<Box<dyn ResolveOrigin>>,
     pub request: ResolvedVc<Request>,
-    pub issue_source: ResolvedVc<IssueSource>,
+    pub issue_source: IssueSource,
 }
 
 #[turbo_tasks::value_impl]
@@ -45,7 +42,7 @@ impl UrlAssetReference {
     pub fn new(
         origin: ResolvedVc<Box<dyn ResolveOrigin>>,
         request: ResolvedVc<Request>,
-        issue_source: ResolvedVc<IssueSource>,
+        issue_source: IssueSource,
     ) -> Vc<Self> {
         Self::cell(UrlAssetReference {
             origin,
@@ -90,20 +87,14 @@ impl ModuleReference for UrlAssetReference {
             *self.origin,
             *self.request,
             Value::new(ReferenceType::Url(UrlReferenceSubType::CssUrl)),
-            Some(*self.issue_source),
+            Some(self.issue_source.clone()),
             false,
         )
     }
 }
 
 #[turbo_tasks::value_impl]
-impl ChunkableModuleReference for UrlAssetReference {
-    #[turbo_tasks::function]
-    fn chunking_type(self: Vc<Self>) -> Vc<ChunkingTypeOption> {
-        // Since this chunk item is embedded, we don't want to put it in the chunk group
-        Vc::cell(Some(ChunkingType::Passthrough))
-    }
-}
+impl ChunkableModuleReference for UrlAssetReference {}
 
 #[turbo_tasks::value_impl]
 impl ValueToString for UrlAssetReference {
@@ -136,7 +127,7 @@ pub async fn resolve_url_reference(
     {
         // TODO(WEB-662) This is not the correct way to get the path of the asset.
         // `asset` is on module-level, but we need the output-level asset instead.
-        let path = asset.ident().path().await?;
+        let path = asset.path().await?;
         let relative_path = context_path
             .get_relative_path_to(&path)
             .unwrap_or_else(|| format!("/{}", path.path).into());

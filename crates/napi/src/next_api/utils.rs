@@ -170,6 +170,7 @@ pub fn create_turbo_tasks(
             turbo_tasks_backend::TurboTasksBackend::new(
                 turbo_tasks_backend::BackendOptions {
                     storage_mode: None,
+                    dependency_tracking,
                     ..Default::default()
                 },
                 noop_backing_storage(),
@@ -289,7 +290,7 @@ impl From<&PlainIssue> for NapiIssue {
                 .map(|styled| serde_json::to_value(StyledStringSerialize::from(styled)).unwrap()),
             documentation_link: issue.documentation_link.to_string(),
             severity: issue.severity.as_str().to_string(),
-            source: issue.source.as_deref().map(|source| source.into()),
+            source: issue.source.as_ref().map(|source| source.into()),
             title: serde_json::to_value(StyledStringSerialize::from(&issue.title)).unwrap(),
             sub_issues: issue
                 .sub_issues
@@ -401,8 +402,8 @@ pub struct NapiSourcePos {
 impl From<SourcePos> for NapiSourcePos {
     fn from(pos: SourcePos) -> Self {
         Self {
-            line: pos.line as u32,
-            column: pos.column as u32,
+            line: pos.line,
+            column: pos.column,
         }
     }
 }

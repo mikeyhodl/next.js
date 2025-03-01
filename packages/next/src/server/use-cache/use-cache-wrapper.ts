@@ -35,14 +35,21 @@ import {
   getClientReferenceManifestForRsc,
   getServerModuleMap,
 } from '../app-render/encryption-utils'
-import type { CacheHandler, CacheEntry } from '../lib/cache-handlers/types'
+import type { CacheEntry } from '../lib/cache-handlers/types'
 import type { CacheSignal } from '../app-render/cache-signal'
 import { decryptActionBoundArgs } from '../app-render/encryption'
 import { InvariantError } from '../../shared/lib/invariant-error'
 import { getDigestForWellKnownError } from '../app-render/create-error-handler'
-import { cacheHandlerGlobal, DYNAMIC_EXPIRE } from './constants'
+import { DYNAMIC_EXPIRE } from './constants'
+import { getCacheHandler } from './handlers'
 import { UseCacheTimeoutError } from './use-cache-errors'
 import { createHangingInputAbortSignal } from '../app-render/dynamic-rendering'
+import {
+  makeErroringExoticSearchParamsForUseCache,
+  type SearchParams,
+} from '../request/search-params'
+import type { Params } from '../request/params'
+import React from 'react'
 
 type CacheKeyParts = [
   buildId: string,
@@ -51,9 +58,13 @@ type CacheKeyParts = [
   args: unknown[],
 ]
 
-const isEdgeRuntime = process.env.NEXT_RUNTIME === 'edge'
+export interface UseCachePageComponentProps {
+  params: Promise<Params>
+  searchParams: Promise<SearchParams>
+  $$isPageComponent: true
+}
 
-const cacheHandlerMap: Map<string, CacheHandler> = new Map()
+const isEdgeRuntime = process.env.NEXT_RUNTIME === 'edge'
 
 function generateCacheEntry(
   workStore: WorkStore,
@@ -156,6 +167,7 @@ function generateCacheEntryWithCacheContext(
     hmrRefreshHash: outerWorkUnitStore && getHmrRefreshHash(outerWorkUnitStore),
     isHmrRefresh: useCacheOrRequestStore?.isHmrRefresh ?? false,
     serverComponentsHmrCache: useCacheOrRequestStore?.serverComponentsHmrCache,
+    forceRevalidate: shouldForceRevalidate(workStore, outerWorkUnitStore),
   }
 
   return workUnitAsyncStorage.run(
@@ -494,13 +506,7 @@ export function cache(
   boundArgsLength: number,
   fn: (...args: unknown[]) => Promise<unknown>
 ) {
-  for (const [key, value] of Object.entries(
-    cacheHandlerGlobal.__nextCacheHandlers || {}
-  )) {
-    cacheHandlerMap.set(key, value as CacheHandler)
-  }
-  const cacheHandler = cacheHandlerMap.get(kind)
-
+  const cacheHandler = getCacheHandler(kind)
   if (cacheHandler === undefined) {
     throw new Error('Unknown cache handler: ' + kind)
   }
@@ -542,6 +548,35 @@ export function cache(
         workUnitStore?.type === 'prerender'
           ? createHangingInputAbortSignal(workUnitStore)
           : undefined
+
+      // When dynamicIO is not enabled, we can not encode searchParams as
+      // hanging promises. To still avoid unused search params from making a
+      // page dynamic, we overwrite them here with a promise that resolves to an
+      // empty object, while also overwriting the to-be-invoked function for
+      // generating a cache entry with a function that creates an erroring
+      // searchParams prop before invoking the original function. This ensures
+      // that used searchParams inside of cached functions would still yield an
+      // error.
+      if (!workStore.dynamicIOEnabled && isPageComponent(args)) {
+        const [{ params, searchParams }] = args
+        // Overwrite the props to omit $$isPageComponent.
+        args = [{ params, searchParams }]
+
+        const originalFn = fn
+
+        fn = {
+          [name]: async ({
+            params: serializedParams,
+          }: Omit<UseCachePageComponentProps, '$$isPageComponent'>) =>
+            originalFn.apply(null, [
+              {
+                params: serializedParams,
+                searchParams:
+                  makeErroringExoticSearchParamsForUseCache(workStore),
+              },
+            ]),
+        }[name] as (...args: unknown[]) => Promise<unknown>
+      }
 
       if (boundArgsLength > 0) {
         if (args.length === 0) {
@@ -656,10 +691,13 @@ export function cache(
           workUnitStore === undefined || workUnitStore.type === 'unstable-cache'
             ? []
             : workUnitStore.implicitTags
-        const entry: undefined | CacheEntry = await cacheHandler.get(
-          serializedCacheKey,
-          implicitTags
-        )
+
+        const forceRevalidate = shouldForceRevalidate(workStore, workUnitStore)
+
+        const entry = forceRevalidate
+          ? undefined
+          : await cacheHandler.get(serializedCacheKey, implicitTags)
+
         const currentTime = performance.timeOrigin + performance.now()
         if (
           workUnitStore !== undefined &&
@@ -821,7 +859,8 @@ export function cache(
       })
     },
   }[name]
-  return cachedFn
+
+  return React.cache(cachedFn)
 }
 
 /**
@@ -841,4 +880,42 @@ function createLazyResult<TResult>(
       return pendingResult.then(onfulfilled, onrejected)
     },
   }
+}
+
+function isPageComponent(
+  args: any[]
+): args is [UseCachePageComponentProps, undefined] {
+  if (args.length !== 2) {
+    return false
+  }
+
+  const [props, ref] = args
+
+  return (
+    ref === undefined && // server components receive an undefined ref arg
+    props !== null &&
+    typeof props === 'object' &&
+    (props as UseCachePageComponentProps).$$isPageComponent
+  )
+}
+
+function shouldForceRevalidate(
+  workStore: WorkStore,
+  workUnitStore: WorkUnitStore | undefined
+): boolean {
+  if (workStore.isOnDemandRevalidate) {
+    return true
+  }
+
+  if (workStore.dev && workUnitStore) {
+    if (workUnitStore.type === 'request') {
+      return workUnitStore.headers.get('cache-control') === 'no-cache'
+    }
+
+    if (workUnitStore.type === 'cache') {
+      return workUnitStore.forceRevalidate
+    }
+  }
+
+  return false
 }
