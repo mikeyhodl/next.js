@@ -29,8 +29,9 @@ use turbopack_core::{
 use super::base::ReferencedAsset;
 use crate::{
     chunk::{EcmascriptChunkPlaceable, EcmascriptExports},
-    code_gen::{CodeGenerateable, CodeGeneration, CodeGenerationHoistedStmt},
+    code_gen::{CodeGeneration, CodeGenerationHoistedStmt},
     magic_identifier,
+    runtime_functions::{TURBOPACK_DYNAMIC, TURBOPACK_ESM},
 };
 
 #[derive(Clone, Hash, Debug, PartialEq, Eq, Serialize, Deserialize, TraceRawVcs, NonLocalValue)]
@@ -412,7 +413,7 @@ pub async fn expand_star_exports(
 
 async fn emit_star_exports_issue(source_ident: Vc<AssetIdent>, message: RcStr) -> Result<()> {
     AnalyzeIssue::new(
-        IssueSeverity::Warning.cell(),
+        IssueSeverity::Warning,
         source_ident,
         Vc::cell("unexpected export *".into()),
         StyledString::Text(message).cell(),
@@ -488,27 +489,23 @@ impl EsmExports {
     }
 }
 
-#[turbo_tasks::value_impl]
-impl CodeGenerateable for EsmExports {
-    #[turbo_tasks::function]
-    async fn code_generation(
+impl EsmExports {
+    pub async fn code_generation(
         self: Vc<Self>,
-        module_graph: Vc<ModuleGraph>,
+        _module_graph: Vc<ModuleGraph>,
         chunking_context: Vc<Box<dyn ChunkingContext>>,
-    ) -> Result<Vc<CodeGeneration>> {
+    ) -> Result<CodeGeneration> {
         let expanded = self.expand_exports().await?;
 
         let mut dynamic_exports = Vec::<Box<Expr>>::new();
         for dynamic_export_asset in &expanded.dynamic_exports {
-            let ident = ReferencedAsset::get_ident_from_placeable(
-                dynamic_export_asset,
-                module_graph,
-                chunking_context,
-            )
-            .await?;
+            let ident =
+                ReferencedAsset::get_ident_from_placeable(dynamic_export_asset, chunking_context)
+                    .await?;
 
             dynamic_exports.push(quote_expr!(
-                "__turbopack_dynamic__($arg)",
+                "$turbopack_dynamic($arg)",
+                turbopack_dynamic: Expr = TURBOPACK_DYNAMIC.into(),
                 arg: Expr = Ident::new(ident.into(), DUMMY_SP, Default::default()).into()
             ));
         }
@@ -546,7 +543,6 @@ impl CodeGenerateable for EsmExports {
                     let referenced_asset =
                         ReferencedAsset::from_resolve_result(esm_ref.resolve_reference()).await?;
                     referenced_asset.get_ident(
-                        module_graph,
                         chunking_context
                     ).await?.map(|ident| {
                         let expr = MemberExpr {
@@ -588,7 +584,7 @@ impl CodeGenerateable for EsmExports {
                     let referenced_asset =
                         ReferencedAsset::from_resolve_result(esm_ref.resolve_reference()).await?;
                     referenced_asset
-                        .get_ident(module_graph, chunking_context)
+                        .get_ident(chunking_context)
                         .await?
                         .map(|ident| {
                             quote!(
@@ -632,7 +628,8 @@ impl CodeGenerateable for EsmExports {
             .collect(),
             vec![CodeGenerationHoistedStmt::new(
                 "__turbopack_esm__".into(),
-                quote!("__turbopack_esm__($getters);" as Stmt,
+                quote!("$turbopack_esm($getters);" as Stmt,
+                    turbopack_esm: Expr = TURBOPACK_ESM.into(),
                     getters: Expr = getters.clone()
                 ),
             )],

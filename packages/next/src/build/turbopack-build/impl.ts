@@ -51,6 +51,7 @@ export async function turbopackBuild(): Promise<{
   const hasRewrites = NextBuildContext.hasRewrites!
   const rewrites = NextBuildContext.rewrites!
   const appDirOnly = NextBuildContext.appDirOnly!
+  const noMangling = NextBuildContext.noMangling!
 
   const startTime = process.hrtime()
   const bindings = await loadBindings(config?.experimental?.useWasmBinary)
@@ -90,6 +91,7 @@ export async function turbopackBuild(): Promise<{
       encryptionKey,
       previewProps,
       browserslistQuery: supportedBrowsers.join(', '),
+      noMangling,
     },
     {
       persistentCaching,
@@ -306,6 +308,7 @@ export async function turbopackBuild(): Promise<{
   }
 }
 
+let shutdownPromise: Promise<void> | undefined
 export async function workerMain(workerData: {
   buildContext: typeof NextBuildContext
 }): Promise<Awaited<ReturnType<typeof turbopackBuild>>> {
@@ -332,5 +335,12 @@ export async function workerMain(workerData: {
   setGlobal('telemetry', telemetry)
 
   const result = await turbopackBuild()
+  shutdownPromise = result.shutdownPromise
   return result
+}
+
+export async function waitForShutdown(): Promise<void> {
+  if (shutdownPromise) {
+    await shutdownPromise
+  }
 }
